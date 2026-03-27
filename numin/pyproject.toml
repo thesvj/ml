@@ -5,7 +5,7 @@ description = "Meta-Learning for OHLCV-to-Returns Prediction"
 readme = "README_ML.md"
 requires-python = ">=3.12"
 authors = [
-    {name = "Saij", email = "saij@example.com"}
+    {name = "Saij", email = "saij@iiitd.ac.in"}
 ]
 
 dependencies = [
