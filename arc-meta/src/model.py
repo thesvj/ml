@@ -2,214 +2,131 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# =========================
-# Positional Encoding (Improved)
-# =========================
-def get_2d_positional_encoding(H, W, C, device):
-    y = torch.linspace(0, 1, H, device=device)
-    x = torch.linspace(0, 1, W, device=device)
-
-    yy, xx = torch.meshgrid(y, x, indexing='ij')
-
-    pos = torch.stack([
-        torch.sin(2 * 3.1415 * xx),
-        torch.cos(2 * 3.1415 * xx),
-        torch.sin(2 * 3.1415 * yy),
-        torch.cos(2 * 3.1415 * yy),
-    ], dim=0)
-
-    pos = pos.unsqueeze(0).repeat(1, C // 4, 1, 1)
-    return pos
-
-
-# =========================
-# Encoder
-# =========================
-class GridEncoder(nn.Module):
+# ==========================================
+# 1. Spatial Embedding
+# ==========================================
+class GridEmbedder(nn.Module):
     def __init__(self, dim=128):
         super().__init__()
-
-        self.embed = nn.Embedding(10, dim)
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, padding=1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(),
-            nn.Conv2d(dim, dim, 3, padding=1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(),
-        )
-
+        # 11 tokens: 0-9 colors + 10 for padding
+        self.embed = nn.Embedding(11, dim)
+        self.proj = nn.Linear(dim, dim)
+        
     def forward(self, x):
-        # x: (B,1,H,W) → (B,H,W)
-        x = x.squeeze(1).long()
-        x = self.embed(x)  # (B,H,W,C)
-        x = x.permute(0, 3, 1, 2)
+        """
+        Input: (B, 1, H, W) -> Output: (B, H*W, dim)
+        """
+        B, C, H, W = x.shape
+        # Flatten H and W into a sequence
+        x = x.view(B, H * W).long()
+        x = self.embed(x) 
+        return self.proj(x)
 
-        feat = self.conv(x)
-
-        B, C, H, W = feat.shape
-        pos = get_2d_positional_encoding(H, W, C, x.device)
-        feat = feat + pos
-
-        return feat
-
-
-# =========================
-# Task Encoder (Token Reduced)
-# =========================
-class TaskEncoder(nn.Module):
-    def __init__(self, dim=128, pool_size=8):
+# ==========================================
+# 2. Hierarchical Reasoning Cell
+# ==========================================
+class HRMCell(nn.Module):
+    def __init__(self, dim=128, T_steps=4):
         super().__init__()
-        self.pool_size = pool_size
+        self.dim = dim
+        self.T_steps = T_steps
+        
+        # Low-Level: Updates local pixel hidden states
+        self.L_step = nn.GRUCell(input_size=dim * 2, hidden_size=dim)
+        # High-Level: Updates the global plan
+        self.H_step = nn.GRUCell(input_size=dim, hidden_size=dim)
+        
+        self.to_logits = nn.Linear(dim, 10)
 
-        self.proj = nn.Conv2d(dim * 2, dim, 1)
-        self.norm = nn.LayerNorm(dim)
+    def forward(self, x_tilde, z_L, z_H):
+        """
+        x_tilde: (B, L, dim) - Embedded query grid
+        z_L: (B, L, dim) - Local latent states
+        z_H: (B, dim) - Global latent state (the "rule")
+        """
+        B, L, D = x_tilde.shape
+        
+        # --- Internal Simulation (Local Refinement) ---
+        for _ in range(self.T_steps):
+            # Broadcast Global State to every pixel in the sequence
+            # (B, D) -> (B, L, D) -> (B*L, D)
+            z_H_expanded = z_H.unsqueeze(1).expand(-1, L, -1).contiguous().view(B * L, D)
+            
+            x_flat = x_tilde.view(B * L, D)
+            z_L_flat = z_L.view(B * L, D)
+            
+            # Concatenate local features with global context
+            l_input = torch.cat([x_flat, z_H_expanded], dim=-1)
+            
+            # Update local state
+            z_L_flat = self.L_step(l_input, z_L_flat)
+            z_L = z_L_flat.view(B, L, D)
+        
+        # --- Global Planning Update ---
+        # Average local insights to update the global rule/strategy
+        z_L_pooled = z_L.mean(dim=1) 
+        z_H_new = self.H_step(z_L_pooled, z_H)
+        
+        # Output color predictions for each pixel
+        logits = self.to_logits(z_L) 
+        
+        return z_L, z_H_new, logits
 
-    def forward(self, sx, sy):
-        delta = sy - sx
-        importance = torch.abs(delta).mean(dim=1, keepdim=True)
-
-        combined = torch.cat([sx, delta], dim=1)
-        tokens = self.proj(combined)
-
-        # importance weighting
-        tokens = tokens * importance
-
-        # spatial reduction
-        tokens = F.adaptive_avg_pool2d(tokens, (self.pool_size, self.pool_size))
-
-        S, C, H, W = tokens.shape
-        tokens = tokens.view(S, C, H * W).permute(0, 2, 1)
-
-        tokens = tokens.reshape(-1, C)
-        tokens = self.norm(tokens)
-
-        return tokens
-
-
-# =========================
-# Cross Attention
-# =========================
-class CrossAttentionBlock(nn.Module):
-    def __init__(self, dim=128, heads=4):
+# ==========================================
+# 3. ARC-HRM Integration
+# ==========================================
+class ARCFewShotHRM(nn.Module):
+    def __init__(self, dim=128, T_steps=4, max_segments=8):
         super().__init__()
-        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, q, kv):
-        attn_out, _ = self.attn(q, kv, kv)
-        return self.norm(q + attn_out)
-
-
-# =========================
-# Decoder
-# =========================
-class Decoder(nn.Module):
-    def __init__(self, dim=128, num_classes=10):
-        super().__init__()
-
-        self.pre_conv = nn.Conv2d(dim, dim, 3, padding=1)
-
-        self.cross_attn = CrossAttentionBlock(dim)
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, padding=1),
+        self.dim = dim
+        self.max_segments = max_segments
+        
+        self.embedder = GridEmbedder(dim)
+        self.hrm_cell = HRMCell(dim, T_steps)
+        
+        self.rule_compressor = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.LayerNorm(dim),
             nn.ReLU(),
-            nn.Conv2d(dim, dim, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(dim, num_classes, 1)
+            nn.Linear(dim, dim)
         )
 
-    def forward(self, query_feat, task_tokens):
-        B, C, H, W = query_feat.shape
+    def extract_rule(self, support_x, support_y):
+        """
+        Compresses support pairs into a single task-level vector.
+        Handles variable number of support examples by mean-pooling.
+        """
+        # Embed and pool across spatial and example dimensions
+        sx_emb = self.embedder(support_x).mean(dim=[0, 1]) 
+        sy_emb = self.embedder(support_y).mean(dim=[0, 1]) 
+        
+        rule_context = torch.cat([sx_emb, sy_emb], dim=-1)
+        # Returns (1, dim)
+        return self.rule_compressor(rule_context).unsqueeze(0)
 
-        # locality bias
-        query_feat = self.pre_conv(query_feat)
-
-        # flatten
-        q = query_feat.view(B, C, H * W).permute(0, 2, 1)
-
-        kv = task_tokens.unsqueeze(0).repeat(B, 1, 1)
-
-        # cross attention
-        q = self.cross_attn(q, kv)
-
-        # reshape
-        q = q.permute(0, 2, 1).view(B, C, H, W)
-
-        # skip connection
-        q = q + query_feat
-
-        return self.conv(q)
-
-
-# =========================
-# ARC Model
-# =========================
-class ARCModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.encoder = GridEncoder()
-        self.task_encoder = TaskEncoder()
-        self.decoder = Decoder()
-
-    def forward(self, support_x, support_y, query_x):
-        sx = self.encoder(support_x)
-        sy = self.encoder(support_y)
-
-        task_tokens = self.task_encoder(sx, sy)
-
-        qx = self.encoder(query_x)
-
-        return self.decoder(qx, task_tokens)
-
-    # =========================
-    # Efficient Adaptation
-    # =========================
-    def forward_with_adaptation(
-        self,
-        support_x,
-        support_y,
-        query_x,
-        steps=20,
-        lr=1e-3,
-        adapt_encoder=False
-    ):
-        model = self
-
-        # cache features (BIG speedup)
-        sx = model.encoder(support_x)
-        sy = model.encoder(support_y)
-
-        if adapt_encoder:
-            params = model.parameters()
-        else:
-            params = model.decoder.parameters()
-
-        optimizer = torch.optim.Adam(params, lr=lr)
-
-        model.train()
-
-        for _ in range(steps):
-            optimizer.zero_grad()
-
-            task_tokens = model.task_encoder(sx, sy)
-            pred = model.decoder(sx, task_tokens)
-
-            loss = F.cross_entropy(pred, support_y.squeeze(1).long())
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            sx = model.encoder(support_x)
-            sy = model.encoder(support_y)
-            task_tokens = model.task_encoder(sx, sy)
-
-            qx = model.encoder(query_x)
-            return model.decoder(qx, task_tokens)
+    def forward(self, support_x, support_y, query_x, return_all_segments=False):
+        B_q, _, H_q, W_q = query_x.shape
+        
+        # 1. Extract the rule (latent representation of the transformation)
+        z_H_rule = self.extract_rule(support_x, support_y) # (1, dim)
+        
+        # 2. Embed the Query Grid
+        q_tilde = self.embedder(query_x) # (B_q, L, dim)
+        seq_len = H_q * W_q
+        
+        # 3. Initialize Latents
+        z_L = torch.zeros(B_q, seq_len, self.dim, device=query_x.device)
+        # Broadcast the single rule vector to match the query batch size
+        z_H = z_H_rule.expand(B_q, -1) 
+        
+        segment_logits = []
+        
+        # 4. Multi-step reasoning "Segments"
+        for m in range(self.max_segments):
+            z_L, z_H, logits = self.hrm_cell(q_tilde, z_L, z_H)
+            
+            # Reshape logits to (Batch, Colors, Height, Width)
+            pred_grid = logits.transpose(1, 2).view(B_q, 10, H_q, W_q)
+            segment_logits.append(pred_grid)
+            
+        return segment_logits if return_all_segments else segment_logits[-1]
